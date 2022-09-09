@@ -1,0 +1,564 @@
+---
+title: "Real-time updating for writing-process data -- Simulation"
+author: "Jens Roeser"
+date: "Compiled `r format(Sys.Date(), '%b %d %Y')`"
+output: 
+  rmdformats::downcute:
+    keep_md: true
+self_contained: true
+thumbnails: false # for images
+lightbox: true
+gallery: false
+highlight: tango
+use_bookdown: true # for cross references
+bibliography: references.bib
+csl: apa.csl
+link-citations: yes
+---
+  
+```{r include = F}
+library(tidyverse)
+library(kableExtra)
+library(janitor)
+library(brms)
+library(polspline)
+library(patchwork)
+library(rmdformats)
+library(gridExtra)
+library(grid)
+library(gtable)
+library(gridExtra)
+library(scales)
+library(caret)
+library(InformationValue)
+
+
+# Calculate Bayes Factor
+BF <- function(ps, prior_sd = 1){
+  fit_posterior <- logspline(ps) 
+  posterior <- dlogspline(0, fit_posterior) # Height of the posterior at 0 
+  prior <- dnorm(0, 0, prior_sd) # Height of the prior at 0
+  BF10 <- prior / posterior 
+  return(BF10)
+}
+
+logit <- function(p) log(p / (1-p))
+ilogit <- function(x) 1 / (1 + exp(-x))
+se_bin <- function(x) sqrt((mean(x, na.rm = T)*(1 - mean(x, na.rm = T)))/length(x)) # se for binary data
+
+# Remove leading zeros and round numbers
+dezero <- function(x, dp){ # dp is decimal places
+  fmt = paste0('%.',dp,'f')
+  x = sprintf(fmt,x)
+  x = str_replace(x, '(-|^)0\\.','\\1\\.')
+  return(x)
+}
+dezero_plot <- function(x) dezero(x, 1)
+
+
+theme_set(theme_bw(base_size = 14) +
+            theme(strip.background = element_blank(),
+                  legend.position = "top",
+                  legend.justification = "right",
+                  panel.background = element_rect(fill = "transparent"), # bg of the panel
+                  plot.background = element_rect(fill = "transparent", color = NA)))
+options(scipen = 999)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, 
+                      message = FALSE, comment = NA,
+                      #                      dev = c("pdf", "png"), 
+                      #                     fig.keep = "all", 
+                      #                    fig.path = "figures/",
+                      fig.align = 'center', 
+                      #                   pdf.options(encoding = "ISOLatin9.enc"),
+                      fig.width = 8, 
+                      fig.height = 5)
+knitr::opts_knit$set(width=90)
+```
+
+
+The following will demonstrate that we can use an on-line (incremental) parameter approximation technique with equivalent accuracy as an off-line parameter approximation using Hamiltonian Monte Carlo MCMC as implemented in Stan [@carpenter2016stan] to uncover a parameter value. To demonstrate this we simulate data based on an known parameter value and used `brms` [@brms1] and then our on-line grid approximation to estimate the parameter value.
+
+The goal of is to implement real-time Bayesian updating to estimate the parameter value and the probability that a participant is currently struggling with their process process for a range of different behavioural measures obtained from the writing process (pausing, editing, lookbacks in text). 
+
+Bayesian methods are ideal in this context because they are conditional on prior information that can be used to evaluate the probability of an observation $y$ under the posterior distribution of the parameter value $\lambda$. Because incremental updating, for our purposes, does not require estimating large numbers of parameters, we can use an analytical solution -- i.e. grid approximation --  which does not require computationally demanding methods and can therefore be used on-line. See e.g. @mcelreath2020statistical Chapter 2.4 and @johnson2022bayes Chapter 6.1 for an overview.
+
+
+## Simulate data: lookbacks
+
+We can model whether a participant is frequently re-reading already-produced text. Frequent re-reading is disrupting the writing process. In this example we will simulate the number of lookback into the text for $N$ increments with each comprising a certain number of key transitions (let's assume 50 just as example). Less lookbacks is not problematic during (prior to final revision); however more lookbacks has potential knock-on effects on higher level processes.
+
+We will simulate `n_increments` observations that come from a distribution $\text{Poisson}(\lambda)$ where the true parameter value for $\lambda$= 4.
+
+```{r echo = T}
+# Simulate lookback data
+# avg. number of lookbacks per 50 keys
+lambda <- 4 # this is the parameter to recover
+# number of increments 
+n_increments <- 50
+# Set seed for replicatability
+set.seed(365)
+# simulate data for n increments
+sim_data <- tibble(increment = 1:n_increments,
+               sum_lookbacks = rpois(n = n_increments, 
+                                     lambda = lambda)) 
+```
+
+Brief overview of data. Observations are increments and the total of lookbacks per increment.
+
+```{r}
+glimpse(sim_data)
+```
+
+
+```{r eval = F}
+ggplot(sim_data, aes(x = increment, y = sum_lookbacks)) +
+  geom_point(size = 3, shape = 21) +
+  geom_line(size = .5) +
+  labs(x = "Increment id", 
+       y = "Number of lookbacks per increment")
+```
+
+## Off-line parameter-value estimation
+
+First we used `brms` to obtain a draw posterior samples from a Poisson model of the simulated data.
+
+```{r echo = T, eval = F}
+# Sampling parameters
+n_cores <- 3
+n_chains <- 3
+iterations <- 20000
+
+# Specify model 
+model <- bf(sum_lookbacks ~ 1, family = poisson())
+
+# Run model
+fit <- brm(model, 
+           data = sim_data,
+           chains = n_chains, 
+           cores = n_cores,
+           iter = iterations, 
+           warmup = iterations/2,
+           seed = 365)
+```
+
+```{r}
+# Load "off-line" model
+fit <- readRDS(file = "stanout/lookback_simulated_offline.rda")
+```
+
+```{r}
+ps <- posterior_summary(fit) %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  as_tibble() %>% 
+  select(1,2,4,5) %>% 
+  filter(str_detect(rowname, "b_Intercept")) %>% 
+  mutate(across(-rowname, exp)) %>% 
+  pivot_longer(-rowname) %>% 
+  pull(value) %>% 
+  round(2)
+
+```
+
+The off-line model estimated the true parameter value for $\lambda$ to be $\hat\lambda=$ `r ps[1]` with a 95% probability interval of [`r ps[2]` -- `r ps[3]`]. In other words, as was to be expected, the off-line model successfully uncovered the parameter value for $\lambda$.
+
+
+## On-line parameter-value estimation
+
+
+For the real-time parameter estimation we use grid-approximation to simulate the posterior of a Gamma-Poisson model. Let $Y$ be the number of lookbacks in each increment where lookbacks occure with an average rate of $\lambda$ per increment. There are $1 ...N$ observations. We will start with a relatively extreme prior on $\lambda$:
+
+$$
+Y_i|\lambda \sim \text{Poisson}(\lambda)\\
+\lambda \sim \text{Gamma}(10,1)
+$$
+
+To simulate the posterior using grid approximation, we first need to specify a grid of reasonable values for parameter values of $\lambda$. We will restrict the parameter space to $\lambda \in [0.1, 20)$ because 20 lookbacks in 50 keystrokes are very uncommon.
+
+Applying the prior to the grid of $\lambda$ values renders the prior probability distribution $P(\lambda)$. 
+
+The Poisson likelihood function of $\lambda$ must be calculated by the product of the individual Poisson probability density functions of each increment. For each incoming observations $y_i \in Y_1 ... Y_N$ the likelihood is being updated so that
+
+$$
+\text{L}(\lambda\mid y_i)=\prod_{i=1}^Nf(y_i \mid\lambda)
+$$ 
+
+For each grid value, we obtain the probability of observing the given data data $P(y \mid \lambda)$. 
+
+The posterior probability of $\lambda$ can then be derived using Bayes' Theorem 
+
+$$
+P(\lambda \mid y_i) \propto P(\lambda) \cdot P(y_i \mid \lambda)
+$$
+
+i.e. the product of the the prior and the likelihood. We can then calculate the probability of any given observation under the posterior distribution. The posterior of the current increment $i$ was then used as the prior for the subsequent increment $i+1$.
+
+During each increment we can also calculate the probability of the current observation $y_i$ given the current posterior, namely $P(y_i \mid \lambda_\text{posterior})$. This would allow us to detect a sudden influx in lookbacks to flag up any number of lookbacks that is extremer than expected, for example when $P(y_i \mid \lambda_\text{posterior}) < .05$.
+
+```{r echo = TRUE}
+# Grid for lambda space
+lambdas <- seq(.1, 20, length = 100)
+
+# Pre-allocation for likelihood
+likelihood <- tibble(.rows = length(lambdas))
+
+# Prior for lambda
+lambda_prior <- 10 # <- this one is obviously a very extreme prior.
+
+# Incrementally update the posterior for every observation.
+for(i in 1:n_increments){
+
+  # Get new observation
+  new_obs <- sim_data$sum_lookbacks[i]
+
+  # Prior probability distribution over lambda
+  prior <- dgamma(lambdas, lambda_prior, 1, log = TRUE)
+
+  # Likelihood of current and previous increments
+  # Sum of the log likelihoods is equivalent to the product of the likelihood
+  likelihood <- rowSums(
+    bind_cols(likelihood, 
+              dpois(new_obs, lambdas, log = TRUE)))
+
+  # We add prior to likelihood cause both are on the log scale
+  posterior <- likelihood + prior
+  
+  # Normalising (so it sums to unity) requires exponential
+  posterior <- exp(posterior) / sum(exp(posterior))
+
+  # Find lambda with highest posterior probability
+  lambda_posterior <- lambdas[which.max(posterior)]
+
+  # Get conditional probability of the observation given the current
+  # parameter estimate.
+  p_obs <- 1 - pgamma(new_obs, lambda_posterior)
+
+  # Save to data  
+  sim_data$lambda_posterior[i] <- lambda_posterior
+  sim_data$lambda_prior[i] <- lambda_prior  
+  sim_data$p_obs[i] <- p_obs
+
+  # New prior for next increment is the current posterior.
+  lambda_prior <- lambda_posterior
+  
+  # Save the latest posterior.
+  last_posterior <- posterior
+}
+
+```
+
+
+Use the posterior value of the last increment to estimate the posterior distribution.
+
+```{r echo = T}
+grid_data <- tibble(lambdas = lambdas,
+                    posterior = last_posterior)
+
+ps_online <- sample_n(grid_data, 
+         size = 10000, 
+         weight = posterior,
+         replace = TRUE) %>% 
+  tabyl(lambdas) 
+```
+
+
+```{r}
+ests <- ps_online %>% 
+  mutate(cd = cumsum(percent),
+         lower = cd <= .025,
+         upper = cd >= .975) %>% 
+  summarise(map = lambdas[percent == max(percent)],
+         lower = lambdas[cd == max(ifelse(lower, cd, 0))],
+         upper = lambdas[cd == min(ifelse(upper, cd, 1))]) %>% 
+  pivot_longer(everything()) %>% 
+  pull(value) %>% 
+  round(2)
+```
+
+The posterior parameter estimate for $\lambda$ obtained by the on-line method was $\hat\lambda=$ `r ests[1]` in a 95% probability interval of [`r ests[2]` -- `r ests[3]`]. As a reminder, the true parameter value was $\lambda=$ `r lambda` and the off-line model estimated $\hat\lambda=$ `r ps[1]` [`r ps[2]` -- `r ps[3]`]. In other words, both the on-line and the off-line approach successfully uncovered the parameter value for $\lambda$.
+
+
+
+```{r eval = F}
+hdi = function(x, x.density, coverage){
+  best = 0
+    for (ai in 1 : (length(x) - 1)){
+      for (bi in (ai + 1) : length(x)){
+        mass = sum(diff(x[ai : bi]) * x.density[(ai + 1) : bi])
+             if (mass >= coverage && mass / (x[bi] - x[ai]) > best){
+               best = mass / (x[bi] - x[ai])
+               ai.best = ai
+               bi.best = bi
+             }
+        }
+      }
+  c(x[ai.best], x[bi.best])}
+
+hdi(test$lambdas, test$percent*10, .95)
+```
+
+The posterior of the on-line parameter estimation is shown in the following figure with the red line indicating the true parameter value.
+
+```{r}
+ggplot(grid_data, aes(x = lambdas, y = posterior)) + 
+  geom_point() + 
+  geom_segment(aes(x = lambdas, xend = lambdas, y = 0, yend = posterior)) +
+  coord_cartesian(xlim = c(2, 6)) +
+#  geom_vline(xintercept = mean, colour = "red") +
+  geom_vline(xintercept = lambda, 
+             colour = "darkred", 
+             linetype = "dashed",
+             size = 1.25) +
+  labs(y = "Posterior probability",
+       x = bquote(lambda))
+
+```
+
+This figure shows the simulated data compared to the prior ($\lambda_\text{prior}$) and the posterior parameter estimate ($\lambda_\text{posterior}$). Note that even though we chose a relatively extreme initial prior, the chain quickly stabalised -- after $\sim$ 20 increments -- on a parameter value for $\lambda$ that is close to the true value represented as horizontal red line. The highlighted red points are observations that were unexpected under the posterior distribution of the current increment, namely data for which $P(\text{y}_i\mid\hat\lambda_\text{posterior})<.05$ was true.
+
+```{r}
+plot_data <- sim_data %>% 
+  mutate(across(starts_with("p_obs"), ~.<.05)) %>% 
+  pivot_longer(c(sum_lookbacks, lambda_posterior, lambda_prior)) 
+
+highlight <- plot_data %>% select(increment, value, p_obs, name) %>% 
+  filter(p_obs, name == "sum_lookbacks")
+
+ggplot(plot_data, aes(x = increment, y = value, colour = name)) +
+  geom_line(size = .5) +
+  geom_hline(yintercept = lambda,             
+             colour = "darkred", 
+             linetype = "dashed",
+             size = .5) +
+  geom_point(size = 2.5, shape = 21) +
+  geom_point(data = highlight, colour = "red",size = 3) +
+  labs(colour = "",
+       y = "Number of lookbacks",
+       x = "Increment id") +
+  scale_colour_viridis_d(breaks=c("lambda_posterior", "lambda_prior", "sum_lookbacks"),
+                        labels = c(~lambda["posterior"],~lambda["prior"], "data"))
+
+```
+
+
+
+
+## Real data: Comparison for extreme value classification
+
+Extract and bin data from participant with the highest number of lookback events.
+
+```{r echo = T}
+# Data of participant with most lookbacks
+data <- read_csv("data/all_data_incremental.csv") %>% 
+  filter(task == "A", ppt == "M19-0036") %>% 
+  select(is_lookback) 
+  
+keys_in_increment <- 50
+n_bins <- floor(nrow(data)/keys_in_increment) * keys_in_increment
+data <- data[1:n_bins,]
+
+data <- data %>% 
+  mutate(increment = rep(1:(n_bins/keys_in_increment), each = keys_in_increment)) %>% 
+  group_by(increment) %>% 
+  summarise(sum_lookbacks = sum(is_lookback)) 
+```
+
+Brief overview of data.
+
+```{r}
+glimpse(data)
+```
+
+```{r}
+# Load "off-line" model
+fit <- readRDS(file = "stanout/lookback_single_ppt_offline.rda")
+```
+
+```{r}
+ps <- posterior_summary(fit) %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  as_tibble() %>% 
+  select(1,2,4,5) %>% 
+  filter(str_detect(rowname, "b_Intercept")) %>% 
+  mutate(across(-rowname, exp)) %>% 
+  pivot_longer(-rowname) %>% 
+  pull(value) %>% 
+  round(2)
+
+```
+
+
+```{r}
+# Grid for lambda space
+lambdas <- seq(.1, 20, length = 100)
+
+# Pre-allocation for likelihood
+likelihood <- tibble(.rows = length(lambdas))
+
+# Prior for lambda
+lambda_prior <- 2 # two lookbacks per 50 keystrokes
+
+# Incrementally update the posterior for every observation.
+for(i in unique(data$increment)){
+
+  # Get new observation
+  new_obs <- data$sum_lookbacks[i]
+
+  # Prior probability distribution over lambda
+  prior <- dgamma(lambdas, lambda_prior, 1, log = TRUE)
+
+  # Likelihood of current and previous increments
+  # Sum of the log likelihoods is equivalent to the product of the likelihood
+  likelihood <- rowSums(
+    bind_cols(likelihood, 
+              dpois(new_obs, lambdas, log = TRUE)))
+
+  # We add prior to likelihood cause both are on the log scale
+  posterior <- likelihood + prior
+  
+  # Normalising (so it sums to unity) requires exponential
+  posterior <- exp(posterior) / sum(exp(posterior))
+
+  # Find lambda with highest posterior probability
+  lambda_posterior <- lambdas[which.max(posterior)]
+
+  # Get conditional probability of the observation given the current
+  # parameter estimate.
+  p_obs <- 1 - pgamma(new_obs, lambda_posterior)
+
+  # Save to data  
+  data$lambda_posterior[i] <- lambda_posterior
+  data$lambda_prior[i] <- lambda_prior  
+  data$p_obs[i] <- p_obs
+
+  # New prior for next increment is the current posterior.
+  lambda_prior <- lambda_posterior
+  
+  # Save the latest posterior.
+  last_posterior <- posterior
+}
+
+grid_data <- tibble(lambdas = lambdas,
+                    posterior = last_posterior)
+
+ps_online <- sample_n(grid_data, 
+         size = 10000, 
+         weight = posterior,
+         replace = TRUE) %>% 
+  tabyl(lambdas) 
+
+ests <- ps_online %>% 
+  mutate(cd = cumsum(percent),
+         lower = cd <= .025,
+         upper = cd >= .975) %>% 
+  summarise(map = lambdas[percent == max(percent)],
+         lower = lambdas[cd == max(ifelse(lower, cd, 0))],
+         upper = lambdas[cd == min(ifelse(upper, cd, 1))]) %>% 
+  pivot_longer(everything()) %>% 
+  pull(value) %>% 
+  round(2)
+```
+
+
+Parameter value estimates were obtained as above using both an off-line model and an on-line model. THe off-line Poisson model estimated the true parameter value for $\lambda$ to be $\hat\lambda=$ `r ps[1]` with a 95% probability interval of [`r ps[2]` -- `r ps[3]`]. The on-line approximation estimated a parameter value of $\hat\lambda=$ `r ests[1]` with a 95% probability interval of [`r ests[2]` -- `r ests[3]`]. As a reminder, the true parameter value was $\lambda=$ `r lambda` and the off-line model estimated $\hat\lambda=$ `r ps[1]` [`r ps[2]` -- `r ps[3]`]. Again, the on-line and the off-line revealed relatively similar parameter estimates.
+
+
+The following figure shows the observed data compared to the prior ($\lambda_\text{prior}$) and the posterior parameter estimate ($\lambda_\text{posterior}$). The highlighted red points are observations that were unexpected under the posterior distribution of the current increment, namely data for which $P(\text{y}_i\mid\hat\lambda_\text{posterior})<.05$ was true.
+
+```{r}
+plot_data <- data %>% 
+  mutate(across(starts_with("p_obs"), ~.<.05)) %>% 
+  pivot_longer(c(sum_lookbacks, lambda_posterior, lambda_prior)) 
+
+highlight <- plot_data %>% select(increment, value, p_obs, name) %>% 
+  filter(p_obs, name == "sum_lookbacks")
+
+ggplot(plot_data, aes(x = increment, y = value, colour = name)) +
+  geom_line(size = .5) +
+  geom_point(size = 2.5, shape = 21) +
+  geom_point(data = highlight, colour = "red",size = 3) +
+  labs(colour = "",
+       y = "Number of lookbacks",
+       x = "Increment id") +
+  scale_colour_viridis_d(breaks=c("lambda_posterior", "lambda_prior", "sum_lookbacks"),
+                        labels = c(~lambda["posterior"],~lambda["prior"], "data"))
+
+```
+
+We are now going to compare how the on-line model compares to the off-line model's ability to detect extreme values. For the off-line model we use the probability of an observation given the posterior predicted data $P(y_i\mid \tilde{y}_i)$ to detect extreme values similar to the on-line method. Again, observations with a probability smaller than .05 given the posterior predicted values will be considered extreme.
+
+
+```{r echo=TRUE}
+data <- data %>% 
+  mutate(predicted = predict(fit, newdata = data)[,1],
+         p_obs_offline = 1 - pgamma(sum_lookbacks, predicted)) %>% 
+  rename(p_obs_online = p_obs) %>% 
+  mutate(across(starts_with("p_"), ~. < .05))
+```
+
+Shown are the observations identified as extreme for the off-line and the on-line model. As can be seen, the off-line model identified two more observations as extreme.
+
+```{r}
+plot_data <- pivot_longer(data, starts_with("p_")) %>% 
+  mutate(across(name, recode, p_obs_offline = "Off-line model",
+                              p_obs_online = "On-line model"))
+highlight <- plot_data %>% select(increment, sum_lookbacks, value, name) %>% 
+  filter(value == TRUE)
+
+ggplot(plot_data, aes(x = increment, y = sum_lookbacks)) +
+  geom_line(size = .5, alpha = .5) +
+  geom_point(size = 2.5, shape = 21, alpha = .5) +
+  geom_point(data = highlight, colour = "red",size = 3) +
+  labs(colour = "",
+       y = "Number of lookbacks",
+       x = "Increment id") +
+  facet_wrap(~name) 
+
+```
+
+Comparing these classifications based on the on-line and the offline model renders the following confusion matrix.
+
+```{r echo = F}
+test <- data %>% select(increment, sum_lookbacks, 
+                        online = p_obs_online, 
+                        offline = p_obs_offline)
+
+optimal <- optimalCutoff(test$offline, test$online)[1]
+
+cm <- confusionMatrix(test$offline, test$online)
+
+test %>% tabyl(offline, online) %>% 
+  adorn_totals(where = c("row", "col"))
+```
+
+```{r}
+# Correct classification accuracy rate
+# Precision: TP / (TP + FP)
+precision <- cm[2,2] / (cm[2,2] + cm[1,2])
+sens <- sensitivity(test$offline, test$online)
+
+# Recall: TP / (TP / FN)
+recall <- cm[2,2] / (cm[2,2] + cm[2,1])
+
+spec <- specificity(test$offline, test$online) # true negative rate
+misclass <- misClassError(test$offline, test$online, threshold = optimal)
+
+# F1 score: (2 * Precicion * Recall) / (precision + Recall)
+f1 <- (2 * precision * recall) / (precision + recall)
+
+# Trim 0s
+f1 <- dezero(f1, 2) 
+recall <- dezero(recall, 2)
+sens <- dezero(sens, 2)
+spec <- dezero(spec, 2)
+misclass <- dezero(misclass, 2)
+```
+
+The confusion matrix renders that the on-line model (assuming the off-line model is the gold-standard for extreme value classification) has a sensitivity (precision) of `r sens`, a recall of `r recall`, a specificity of `r spec` and a misclassification error of `r misclass`. The F1 scores is `r f1`. 
+
+
+## References
